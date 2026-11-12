@@ -47,6 +47,7 @@ import {
   observeStatus,
   loadStatusConfig,
 } from "./status.ts";
+import { loadSubagentsConfig } from "./config.ts";
 import {
   getSubagentActivityFile,
   readSubagentActivityFile,
@@ -148,7 +149,7 @@ interface AgentDefaults {
   disableModelInvocation?: boolean;
 }
 
-type AgentSource = "package" | "global" | "project";
+type AgentSource = "package" | "config" | "global" | "project";
 
 interface AgentDefinition extends AgentDefaults {
   name: string;
@@ -197,6 +198,10 @@ function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
+function getConfiguredAgentDirs(): string[] {
+  return loadSubagentsConfig(getAgentConfigDir()).agentDirs;
+}
+
 function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
 }
@@ -204,6 +209,11 @@ function getBundledAgentsDir(): string {
 function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
   const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
   return match ? match[1].trim() : undefined;
+}
+
+/** Also accept YAML flow lists (`tools: [read, bash]`), which pstack-pi's agents use. */
+function getFrontmatterList(frontmatter: string, key: string): string | undefined {
+  return getFrontmatterValue(frontmatter, key)?.replace(/^\[(.*)\]$/, "$1");
 }
 
 function parseOptionalBoolean(value: string | undefined): boolean | undefined {
@@ -229,16 +239,16 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
     description: getFrontmatterValue(frontmatter, "description"),
     model: getFrontmatterValue(frontmatter, "model"),
-    tools: getFrontmatterValue(frontmatter, "tools"),
+    tools: getFrontmatterList(frontmatter, "tools"),
     systemPromptMode:
       systemPromptMode === "replace"
         ? "replace"
         : systemPromptMode === "append"
           ? "append"
           : undefined,
-    skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
+    skills: getFrontmatterList(frontmatter, "skill") ?? getFrontmatterList(frontmatter, "skills"),
     thinking: getFrontmatterValue(frontmatter, "thinking"),
-    denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
+    denyTools: getFrontmatterList(frontmatter, "deny-tools"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
@@ -255,6 +265,7 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   const agents = new Map<string, ListedAgentDefinition>();
   const dirs: Array<{ path: string; source: AgentSource }> = [
     { path: getBundledAgentsDir(), source: "package" },
+    ...[...getConfiguredAgentDirs()].reverse().map((path) => ({ path, source: "config" as const })),
     { path: join(getAgentConfigDir(), "agents"), source: "global" },
     { path: join(process.cwd(), ".pi", "agents"), source: "project" },
   ];
@@ -358,6 +369,7 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   const paths = [
     join(process.cwd(), ".pi", "agents", `${agentName}.md`),
     join(configDir, "agents", `${agentName}.md`),
+    ...getConfiguredAgentDirs().map((dir) => join(dir, `${agentName}.md`)),
     join(getBundledAgentsDir(), `${agentName}.md`),
   ];
 
@@ -1648,7 +1660,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.registerCommand("subagents-list", {
     description:
       "List all available subagent definitions. " +
-      "Scans project-local .pi/agents/, global ~/.pi/agent/agents/, and bundled agents.",
+      "Scans project-local .pi/agents/, global ~/.pi/agent/agents/, configured agentDirs, and bundled agents.",
     handler: async (_args, ctx) => {
       const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
       const lines = list.map((a) => {
