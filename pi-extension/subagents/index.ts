@@ -162,10 +162,9 @@ interface ListedAgentDefinition extends AgentDefinition {
 
 /** Tools that are gated by `spawning: false` */
 const SPAWNING_TOOLS = new Set([
-  "subagent",
-  "subagent_interrupt",
-  "subagents_list",
-  "subagent_resume",
+  "subagent_start",
+  "subagent_stop",
+  "subagent_send",
 ]);
 
 /**
@@ -343,7 +342,7 @@ function resolveLaunchBehavior(
  *      driven by the user in their own pane (planner, iterate/fork) and
  *      stall pings are noise.
  *
- * When no agent defs exist at all (bare `subagent({ name, task })` call,
+ * When no agent defs exist at all (bare `subagent_start({ name, task })` call,
  * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
  * subagent is treated as interactive — matching the intent of iterate.
  */
@@ -457,7 +456,7 @@ function resolveResultPresentation(
       `(provider/agent error — auto-retry exhausted).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
-      `subagent or resume the session with subagent_resume.${sessionRef}`
+      `subagent or resume the session with subagent_send.${sessionRef}`
     );
   }
 
@@ -1389,23 +1388,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   const shouldRegister = (name: string) => !deniedTools.has(name);
 
-  // ── subagent tool ──
-  if (shouldRegister("subagent"))
+  // ── subagent_start tool ──
+  if (shouldRegister("subagent_start"))
     pi.registerTool({
-      name: "subagent",
+      name: "subagent_start",
       label: "Subagent",
       description:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
+        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call any tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
+        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call any tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       parameters: SubagentParams,
@@ -1593,10 +1592,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // ── subagent_interrupt tool ──
-  if (shouldRegister("subagent_interrupt"))
+  // ── subagent_stop tool ──
+  if (shouldRegister("subagent_stop"))
     pi.registerTool({
-      name: "subagent_interrupt",
+      name: "subagent_stop",
       label: "Interrupt Subagent",
       description:
         "Send Escape to the active turn of a currently running Pi-backed subagent. " +
@@ -1645,66 +1644,27 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // ── subagents_list tool ──
-  if (shouldRegister("subagents_list"))
+  // ── /subagents-list command ── (a command, not a tool, in this fork)
+  pi.registerCommand("subagents-list", {
+    description:
+      "List all available subagent definitions. " +
+      "Scans project-local .pi/agents/, global ~/.pi/agent/agents/, and bundled agents.",
+    handler: async (_args, ctx) => {
+      const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+      const lines = list.map((a) => {
+        const badge = a.source === "project" ? " (project)" : "";
+        const desc = a.description ? ` — ${a.description}` : "";
+        const model = a.model ? ` [${a.model}]` : "";
+        return `• ${a.name}${badge}${model}${desc}`;
+      });
+      ctx.ui.notify(lines.length > 0 ? lines.join("\n") : "No subagent definitions found.", "info");
+    },
+  });
+
+  // ── subagent_send tool ──
+  if (shouldRegister("subagent_send"))
     pi.registerTool({
-      name: "subagents_list",
-      label: "List Subagents",
-      description:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
-      promptSnippet:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
-      parameters: Type.Object({}),
-
-      async execute() {
-        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
-
-        if (list.length === 0) {
-          return {
-            content: [{ type: "text", text: "No subagent definitions found." }],
-            details: { agents: [] },
-          };
-        }
-
-        const lines = list.map((a) => {
-          const badge = a.source === "project" ? " (project)" : "";
-          const desc = a.description ? ` — ${a.description}` : "";
-          const model = a.model ? ` [${a.model}]` : "";
-          return `• ${a.name}${badge}${model}${desc}`;
-        });
-
-        return {
-          content: [{ type: "text", text: lines.join("\n") }],
-          details: { agents: list },
-        };
-      },
-
-      renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        const agents = details?.agents ?? [];
-        if (agents.length === 0) {
-          return new Text(theme.fg("dim", "No subagent definitions found."), 0, 0);
-        }
-        const lines = agents.map((a: any) => {
-          const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
-          const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-          const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
-          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
-        });
-        return new Text(lines.join("\n"), 0, 0);
-      },
-    });
-
-
-
-  // ── subagent_resume tool ──
-  if (shouldRegister("subagent_resume"))
-    pi.registerTool({
-      name: "subagent_resume",
+      name: "subagent_send",
       label: "Resume Subagent",
       description:
         "Resume a previous sub-agent session in a new multiplexer pane. " +
@@ -1965,8 +1925,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     handler: async (args, _ctx) => {
       const task = args.trim() || "";
       const toolCall = task
-        ? `Use subagent to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
-        : `Use subagent to fork a session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
+        ? `Use subagent_start to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
+        : `Use subagent_start to fork a session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
       pi.sendUserMessage(toolCall);
     },
   });
@@ -1996,7 +1956,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
-      const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
+      const toolCall = `Use subagent_start with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
     },
   });
