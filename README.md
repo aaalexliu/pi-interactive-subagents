@@ -6,7 +6,7 @@ https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
 ## How It Works
 
-Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `starting`, `active`, `waiting`, `stalled`, or `running`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
+Call `subagent_start()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `starting`, `active`, `waiting`, `stalled`, or `running`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -15,11 +15,11 @@ Call `subagent()` and it **returns immediately**. The sub-agent runs in its own 
 ╰────────────────────────────────────────────────────╯
 ```
 
-For parallel execution, just call `subagent` multiple times — they all run concurrently:
+For parallel execution, just call `subagent_start` multiple times — they all run concurrently:
 
 ```typescript
-subagent({ name: "Scout: Auth", agent: "scout", task: "Analyze auth module" });
-subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
+subagent_start({ name: "Scout: Auth", agent: "scout", task: "Analyze auth module" });
+subagent_start({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 // Both return immediately, results steer back independently
 ```
 
@@ -56,26 +56,48 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
+Settings live in one optional user file, `${PI_CODING_AGENT_DIR:-~/.pi/agent}/interactive-subagents.json`. A missing file or key means the default. Edits apply on the next spawn. If the file is not valid, Pi warns you and keeps the last good settings:
+
+```json
+{
+  "maxConcurrent": 4,
+  "cmuxLayout": "grid",
+  "agentDirs": ["~/.pi/agent/git/github.com/aaalexliu/pstack-pi/agents"]
+}
+```
+
+| Key             | Default  | Meaning                                                                                                                       |
+| --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `maxConcurrent` | `4`      | Most children one parent runs at once. Extra `subagent_start` calls return a queued result and start when a slot frees.      |
+| `cmuxLayout`    | `"grid"` | `"grid"`: one pane per child in a 2x2 grid. `"tabs"`: every child is a tab in one pane. Both live in the `agents:` workspace. |
+| `agentDirs`     | `[]`     | Extra folders of agent `.md` files, searched after `~/.pi/agent/agents/` and before the bundled agents.                      |
+
+In cmux, all children of one parent session live in one separate workspace named `agents: <parent session name>` (the cwd basename when the session has no name). It opens right after the parent's workspace in the sidebar, without taking focus. With the default `"grid"` layout each running child gets its own pane: child 1 top-left, child 2 top-right, child 3 bottom-left, child 4 bottom-right. A child that starts after another closed splits the largest pane left. The workspace closes with its last child, unless you opened a terminal or tab of your own there. Then it stays open and the next child starts in a new workspace.
+
+In tmux, each child opens as a new background window, named after the child, in the parent's tmux session. Zellij and WezTerm keep their split behavior.
+
+If you close a running child's pane, window, or workspace in cmux, tmux, or WezTerm, the parent gets a report that the child stopped, with its session path so `subagent_send` can resume it, and a queued child takes its slot. In Zellij the parent keeps waiting.
+
 Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
 ## What's Included
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 3 main-session tools + 4 commands, plus 1 subagent-only tool:
 
-| Tool                 | Description                                                                                 |
-| -------------------- | ------------------------------------------------------------------------------------------- |
-| `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
-| `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
-| `subagents_list`     | List available agent definitions                                                            |
-| `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
+| Tool             | Description                                                                     |
+| ---------------- | ------------------------------------------------------------------------------- |
+| `subagent_start` | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately) |
+| `subagent_stop`  | Interrupt a running Pi-backed subagent's current turn                           |
+| `subagent_send`  | Resume a previous sub-agent session (async)                                     |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
 | `/plan`                    | Start a full planning workflow       |
 | `/iterate`                 | Fork into a subagent for quick fixes |
 | `/subagent <agent> <task>` | Spawn a named agent directly         |
+| `/subagents-list`          | List available agent definitions     |
 
 ### Bundled Agents
 
@@ -94,7 +116,7 @@ Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global**
 ## Async Subagent Flow
 
 ```
-1. Agent calls subagent()          → returns immediately ("started")
+1. Agent calls subagent_start()    → returns immediately ("started")
 2. Sub-agent runs in mux pane      → widget shows live status
 3. User keeps chatting             → main session fully interactive
 4. Sub-agent finishes              → result steered back as a normal completion/failure
@@ -151,16 +173,16 @@ cp config.json.example config.json
 
 ```typescript
 // Named agent with defaults from agent definition
-subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
+subagent_start({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
 
 // Force a full-context fork for this spawn
-subagent({ name: "Iterate", fork: true, task: "Fix the bug where..." });
+subagent_start({ name: "Iterate", fork: true, task: "Fix the bug where..." });
 
 // Agent defaults can choose a different session-mode via frontmatter
-subagent({ name: "Planner", agent: "planner", task: "Work through the design with me" });
+subagent_start({ name: "Planner", agent: "planner", task: "Work through the design with me" });
 
 // Custom working directory
-subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." });
+subagent_start({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." });
 ```
 
 ### Parameters
@@ -182,12 +204,12 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 
 ## Interrupting a running subagent
 
-Use `subagent_interrupt` to cancel the active turn of a running Pi-backed subagent:
+Use `subagent_stop` to cancel the active turn of a running Pi-backed subagent:
 
 ```typescript
-subagent_interrupt({ id: "abcd1234" });
+subagent_stop({ id: "abcd1234" });
 // or
-subagent_interrupt({ name: "Scout" });
+subagent_stop({ name: "Scout" });
 ```
 
 This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately moves the child back to `waiting`, and stale pre-interrupt snapshots are ignored. If the child starts work later, newer snapshots return it to `active`; completion, failure, and `caller_ping` still flow through normally.
@@ -200,12 +222,12 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 
 ## caller_ping — Child-to-Parent Help Request
 
-The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.
+The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_send`.
 
 **`caller_ping` parameters:**
 - `message` (required): What you need help with
 
-**`subagent_resume` parameters:**
+**`subagent_send` parameters:**
 - `sessionPath` (required): Path to the child session `.jsonl` file
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
 - `message` (optional): Follow-up prompt to send after resuming
@@ -215,7 +237,7 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)
 3. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"*
-4. Parent resumes the child session via `subagent_resume` with the response
+4. Parent resumes the child session via `subagent_send` with the response
 5. Child picks up where it left off with the parent's guidance
 
 **Example:**
@@ -294,7 +316,7 @@ You are a specialized agent that does X...
 | Field         | Type    | Description                                                                                                                                                                                                                                                                 |
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
-| `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
+| `description` | string  | Shown in `/subagents-list` output                                                                                                                                                                                                                                           |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
@@ -305,11 +327,11 @@ You are a specialized agent that does X...
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
-| `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
+| `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `/subagents-list`. The agent still remains directly invokable by explicit name via `subagent_start({ agent: "name", ... })`. |
 
 ---
 
-Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
+Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `/subagents-list`.
 
 ### `session-mode`
 
@@ -375,23 +397,23 @@ name: planner
 Or per spawn:
 
 ```typescript
-subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
+subagent_start({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 ```
 
 ---
 
 ## Tool Access Control
 
-By default, every sub-agent can spawn further sub-agents. Control this with frontmatter:
+Sub-agents get no spawning tools unless their agent file sets `spawning: true`. Every child also runs with `PSTACK_SUBAGENT_DEPTH=1`, which hides pstack-pi's own `subagent` tool. Control this with frontmatter:
 
-### `spawning: false`
+### `spawning: true`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Grants the subagent lifecycle tools (`subagent_start`, `subagent_stop`, `subagent_send`) to a child:
 
 ```yaml
 ---
-name: worker
-spawning: false
+name: planner
+spawning: true
 ---
 ```
 
@@ -402,7 +424,7 @@ Fine-grained control over individual extension tools:
 ```yaml
 ---
 name: focused-agent
-deny-tools: subagent
+deny-tools: subagent_start
 ---
 ```
 
@@ -410,7 +432,7 @@ deny-tools: subagent
 
 | Agent      | `spawning`  | Rationale                                    |
 | ---------- | ----------- | -------------------------------------------- |
-| planner    | _(default)_ | Legitimately spawns scouts for investigation |
+| planner    | _(default)_ | Set `true` to let it spawn scouts            |
 | worker     | `false`     | Should implement tasks, not delegate         |
 | researcher | `false`     | Should research, not spawn                   |
 | reviewer   | `false`     | Should review, not spawn                     |
@@ -435,8 +457,8 @@ project/
 ```
 
 ```typescript
-subagent({ name: "Game Designer", cwd: "agents/game-designer", task: "Design the combat system" });
-subagent({ name: "SRE", cwd: "agents/sre", task: "Review deployment pipeline" });
+subagent_start({ name: "Game Designer", cwd: "agents/game-designer", task: "Design the combat system" });
+subagent_start({ name: "SRE", cwd: "agents/sre", task: "Review deployment pipeline" });
 ```
 
 Set a default `cwd` in agent frontmatter:
@@ -459,7 +481,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 [scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
 [scout] — 12 available  (Ctrl+J to collapse)          ← expanded
   read, bash, edit, write, todo, ...
-  denied: subagent, subagents_list, ...
+  denied: subagent_start, subagent_send, ...
 ```
 
 ---

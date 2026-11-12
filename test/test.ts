@@ -2,7 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
@@ -18,6 +18,10 @@ import {
 } from "../pi-extension/subagents/session.ts";
 
 import {
+  closeSurface,
+  createSurface,
+  isPaneGoneError,
+  pollForExit,
   shellEscape,
   isCmuxAvailable,
   isWezTermAvailable,
@@ -55,6 +59,12 @@ import {
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
+import { addCmuxSplit, planCmuxSplit, removeCmuxPane } from "../pi-extension/subagents/cmux-layout.ts";
+import {
+  DEFAULT_SUBAGENTS_CONFIG,
+  loadSubagentsConfig,
+  parseSubagentsConfig,
+} from "../pi-extension/subagents/config.ts";
 
 // --- Helpers ---
 
@@ -121,6 +131,114 @@ function restoreEnvVar(name: string, value: string | undefined) {
     return;
   }
   process.env[name] = value;
+}
+
+/**
+ * A stand-in `cmux` on PATH that keeps workspaces, panes, and surfaces in a JSON
+ * file and logs each call. The socket path points nowhere, so a call that
+ * missed the fake could not reach the cmux this test may run inside.
+ */
+const FAKE_CMUX = `#!/usr/bin/env node
+const fs = require("fs");
+const path = require("path");
+const dir = process.env.FAKE_CMUX_DIR;
+const file = path.join(dir, "state.json");
+const state = JSON.parse(fs.readFileSync(file, "utf8"));
+let args = process.argv.slice(2);
+fs.appendFileSync(path.join(dir, "log"), args.join(" ") + "\\n");
+if (args[0] === "--json") args = args.slice(1);
+const flag = (name) => args[args.indexOf(name) + 1];
+const next = (kind) => kind + ":" + state.next++;
+const save = () => fs.writeFileSync(file, JSON.stringify(state));
+const fail = (message) => { process.stderr.write("Error: " + message + "\\n"); process.exit(1); };
+const workspace = (ref) => {
+  if (state.lagging && state.lagging[ref] > 0) {
+    state.lagging[ref]--;
+    save();
+    fail("Workspace ref not found: " + ref);
+  }
+  return state.workspaces[ref] || fail("Workspace ref not found: " + ref);
+};
+const paneOf = (surface) => {
+  for (const ws of Object.values(state.workspaces))
+    for (const [pane, surfaces] of Object.entries(ws)) if (surfaces.includes(surface)) return { ws, pane, surfaces };
+  return null;
+};
+const [cmd, sub] = args;
+if (state.touch && state.touch[cmd]) fs.writeFileSync(state.touch[cmd], "");
+if (state.fail && state.fail[cmd]) fail(state.fail[cmd]);
+if (cmd === "workspace" && sub === "create") {
+  const ref = next("workspace");
+  state.workspaces[ref] = { [next("pane")]: [next("surface")] };
+  if (state.lagLookups) state.lagging = { [ref]: state.lagLookups };
+  save();
+  console.log("OK " + ref);
+} else if (cmd === "workspace" && sub === "close") {
+  workspace(args[2]);
+  delete state.workspaces[args[2]];
+  save();
+} else if (cmd === "list-panes") {
+  const ws = workspace(flag("--workspace"));
+  console.log(JSON.stringify({ panes: Object.entries(ws).map(([ref, surface_refs]) => ({ ref, surface_refs })) }));
+} else if (cmd === "tree") {
+  workspace(flag("--workspace"));
+} else if (cmd === "new-surface") {
+  const pane = workspace(flag("--workspace"))[flag("--pane")];
+  const surface = next("surface");
+  pane.push(surface);
+  save();
+  console.log("OK " + surface + " " + flag("--pane"));
+} else if (cmd === "new-split") {
+  const ws = workspace(flag("--workspace"));
+  const pane = next("pane");
+  const surface = next("surface");
+  ws[pane] = [surface];
+  save();
+  console.log("OK " + surface + " " + pane);
+} else if (cmd === "close-surface") {
+  const owner = paneOf(flag("--surface")) || fail("Surface ref not found: " + flag("--surface"));
+  owner.surfaces.splice(owner.surfaces.indexOf(flag("--surface")), 1);
+  if (owner.surfaces.length === 0) delete owner.ws[owner.pane];
+  save();
+} else if (cmd === "read-screen") {
+  if (!paneOf(flag("--surface"))) fail("not_found: Surface not found for the given surface_id");
+} else if (cmd === "identify") {
+  process.exit(1);
+}
+`;
+
+async function withFakeCmux(fn: (cmux: {
+  calls(): string[];
+  workspaces(): Record<string, Record<string, string[]>>;
+  update(change: (state: any) => void): void;
+}) => Promise<void>) {
+  const dir = createTestDir();
+  writeFileSync(join(dir, "cmux"), FAKE_CMUX, { mode: 0o755 });
+  writeFileSync(join(dir, "state.json"), JSON.stringify({ next: 1, workspaces: {} }));
+  writeFileSync(join(dir, "log"), "");
+  const saved = Object.fromEntries(
+    ["PATH", "PI_SUBAGENT_MUX", "CMUX_SOCKET_PATH", "CMUX_WORKSPACE_ID", "FAKE_CMUX_DIR"].map((k) => [k, process.env[k]]),
+  );
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+  process.env.PI_SUBAGENT_MUX = "cmux";
+  process.env.CMUX_SOCKET_PATH = join(dir, "no-such.sock");
+  delete process.env.CMUX_WORKSPACE_ID;
+  process.env.FAKE_CMUX_DIR = dir;
+  const readState = () => JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+  try {
+    await fn({
+      calls: () => readFileSync(join(dir, "log"), "utf8").trim().split("\n").filter(Boolean),
+      workspaces: () => readState().workspaces,
+      update(change) {
+        const state = readState();
+        change(state);
+        writeFileSync(join(dir, "state.json"), JSON.stringify(state));
+      },
+    });
+  } finally {
+    for (const [k, v] of Object.entries(saved)) restoreEnvVar(k, v);
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 function withMockedNow<T>(now: number, fn: () => T): T {
@@ -866,6 +984,17 @@ describe("status.ts", () => {
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
+  async function listAgentsViaCommand(): Promise<string> {
+    const { api, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const command = registeredCommands.find((command) => command.name === "subagents-list");
+    assert.ok(command, "expected /subagents-list to be registered");
+    const notes: string[] = [];
+    await command.handler("", { ui: { notify: (text: string) => notes.push(text) } });
+    assert.equal(notes.length, 1);
+    return notes[0];
+  }
+
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1124,17 +1253,9 @@ describe("subagent discovery", () => {
         ].join("\n"),
       );
 
-      const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
+      const text = await listAgentsViaCommand();
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
-
-      const result = await tool.execute();
-      const agents = result.details?.agents ?? [];
-
-      assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
-      assert.match(result.content[0].text, /visible-discovery-test-agent/);
+      assert.match(text, /visible-discovery-test-agent/);
     });
   });
 
@@ -1152,17 +1273,9 @@ describe("subagent discovery", () => {
         "You are the hidden agent.",
       );
 
-      const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
+      const text = await listAgentsViaCommand();
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
-
-      const result = await tool.execute();
-      const agents = result.details?.agents ?? [];
-
-      assert.equal(agents.some((agent: any) => agent.name === "hidden-discovery-test-agent"), false);
-      assert.doesNotMatch(result.content[0].text, /hidden-discovery-test-agent/);
+      assert.doesNotMatch(text, /hidden-discovery-test-agent/);
 
       const loaded = testApi.loadAgentDefaults("hidden-discovery-test-agent");
       assert.ok(loaded, "expected hidden agent to remain directly loadable");
@@ -1196,17 +1309,9 @@ describe("subagent discovery", () => {
         "You are the project hidden agent.",
       );
 
-      const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
+      const text = await listAgentsViaCommand();
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
-
-      const result = await tool.execute();
-      const agents = result.details?.agents ?? [];
-
-      assert.equal(agents.some((agent: any) => agent.name === "shadowed-discovery-test-agent"), false);
-      assert.doesNotMatch(result.content[0].text, /shadowed-discovery-test-agent/);
+      assert.doesNotMatch(text, /shadowed-discovery-test-agent/);
 
       const loaded = testApi.loadAgentDefaults("shadowed-discovery-test-agent");
       assert.ok(loaded, "expected project override to remain directly loadable");
@@ -1216,6 +1321,82 @@ describe("subagent discovery", () => {
     });
   });
 });
+describe("interactive-subagents.json", () => {
+  it("uses the defaults when the file is missing", () => {
+    withTempDir((dir) => {
+      assert.deepEqual(loadSubagentsConfig(dir), { maxConcurrent: 4, cmuxLayout: "grid", agentDirs: [] });
+    });
+  });
+
+  it("reads maxConcurrent, cmuxLayout, and agentDirs from the agent dir", () => {
+    withTempDir((dir) => {
+      writeFileSync(
+        join(dir, "interactive-subagents.json"),
+        JSON.stringify({ maxConcurrent: 2, cmuxLayout: "tabs", agentDirs: ["/abs/agents", "rel/agents", "~/home-agents"] }),
+      );
+      assert.deepEqual(loadSubagentsConfig(dir), {
+        maxConcurrent: 2,
+        cmuxLayout: "tabs",
+        agentDirs: ["/abs/agents", join(dir, "rel/agents"), join(homedir(), "home-agents")],
+      });
+    });
+  });
+
+  it("fills in defaults for keys the file leaves out", () => {
+    assert.deepEqual(parseSubagentsConfig({ cmuxLayout: "tabs" }, "test", "/base"), {
+      ...DEFAULT_SUBAGENTS_CONFIG,
+      cmuxLayout: "tabs",
+    });
+  });
+
+  it("rejects bad values and unknown keys with the file path in the error", () => {
+    for (const raw of [
+      { maxConcurrent: 0 },
+      { maxConcurrent: 2.5 },
+      { cmuxLayout: "split" },
+      { agentDirs: "/one/dir" },
+      { agentDirs: [""] },
+      { maxconcurrent: 2 },
+      [],
+    ]) {
+      assert.throws(() => parseSubagentsConfig(raw, "/cfg.json", "/base"), /Invalid subagents config \/cfg\.json/);
+    }
+  });
+
+  it("rejects malformed JSON", () => {
+    withTempDir((dir) => {
+      writeFileSync(join(dir, "interactive-subagents.json"), "{ nope");
+      assert.throws(() => loadSubagentsConfig(dir), /Invalid subagents config/);
+    });
+  });
+
+  it("searches agentDirs after the user dir and before the bundled agents", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    await withIsolatedAgentEnv(async ({ globalDir, globalAgentsDir }) => {
+      const firstDir = join(globalDir, "extra-1");
+      const secondDir = join(globalDir, "extra-2");
+      writeFileSync(join(globalDir, "interactive-subagents.json"), JSON.stringify({ agentDirs: [firstDir, secondDir] }));
+      writeAgentFile(firstDir, "scout", "name: scout\nmodel: extra-1/scout");
+      writeAgentFile(secondDir, "scout", "name: scout\nmodel: extra-2/scout");
+      writeAgentFile(secondDir, "extra-only", "name: extra-only\ndescription: From extra-2\ntools: [read, grep, find, ls]");
+      writeAgentFile(globalAgentsDir, "extra-only", "name: extra-only\nmodel: user/extra-only");
+
+      assert.equal(testApi.loadAgentDefaults("scout").model, "extra-1/scout");
+      assert.equal(testApi.loadAgentDefaults("extra-only").model, "user/extra-only");
+
+      const listed = testApi.discoverAgentDefinitions();
+      assert.equal(listed.find((agent: any) => agent.name === "scout").model, "extra-1/scout");
+      assert.equal(listed.find((agent: any) => agent.name === "extra-only").model, "user/extra-only");
+      assert.ok(listed.some((agent: any) => agent.name === "worker"), "bundled agents still listed");
+
+      rmSync(globalAgentsDir, { recursive: true, force: true });
+      const fromExtra = testApi.loadAgentDefaults("extra-only");
+      assert.equal(fromExtra.tools, "read, grep, find, ls");
+      assert.equal(testApi.buildSubagentToolAllowlist(fromExtra.tools), "read,grep,find,ls,caller_ping,subagent_done");
+    });
+  });
+});
+
 describe("subagent-done.ts", () => {
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
@@ -1360,6 +1541,27 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("registers the renamed tools and leaves subagent and subagents_list to other packages", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    assert.deepEqual(
+      registeredTools.map((tool) => tool.name).sort(),
+      ["subagent_send", "subagent_start", "subagent_stop"],
+    );
+  });
+
+  it("names the renamed tools in the commands that drive the model", () => {
+    const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    registeredCommands.find((command) => command.name === "subagent").handler("scout map the repo", { ui: { notify() {} } });
+    registeredCommands.find((command) => command.name === "iterate").handler("fix it", {});
+
+    assert.equal(sentUserMessages.length, 2);
+    for (const message of sentUserMessages) assert.match(message, /^Use subagent_start /);
+  });
+
   it("defaults resumed subagents to auto-exit and non-interactive tracking", () => {
     const testApi = (subagentsModule as any).__test__;
 
@@ -1373,21 +1575,32 @@ describe("tool registration", () => {
     });
   });
 
+  it("denies spawning tools to every child unless its agent file sets spawning: true", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const spawningTools = ["subagent_send", "subagent_start", "subagent_stop"];
+
+    for (const defs of [null, {}, { spawning: false }]) {
+      assert.deepEqual([...testApi.resolveDenyTools(defs)].sort(), spawningTools);
+    }
+    assert.deepEqual([...testApi.resolveDenyTools({ spawning: true })], []);
+    assert.deepEqual([...testApi.resolveDenyTools({ spawning: true, denyTools: "bash" })], ["bash"]);
+  });
+
   it("expands spawning false to deny subagent interruption", () => {
     const testApi = (subagentsModule as any).__test__;
     const denied = testApi.resolveDenyTools({ spawning: false });
 
-    assert.equal(denied.has("subagent"), true);
-    assert.equal(denied.has("subagent_interrupt"), true);
-    assert.equal(denied.has("subagent_resume"), true);
+    assert.equal(denied.has("subagent_start"), true);
+    assert.equal(denied.has("subagent_stop"), true);
+    assert.equal(denied.has("subagent_send"), true);
   });
 
   it("renders partial subagent tool-call args without throwing", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
-    assert.ok(subagentTool, "expected subagent tool to be registered");
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent_start");
+    assert.ok(subagentTool, "expected subagent_start tool to be registered");
 
     const theme = {
       fg(_color: string, text: string) {
@@ -1403,12 +1616,12 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
-  it("registers subagent_resume with an autoExit override", () => {
+  it("registers subagent_send with an autoExit override", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
-    const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
-    assert.ok(resumeTool, "expected subagent_resume tool to be registered");
+    const resumeTool = registeredTools.find((tool) => tool.name === "subagent_send");
+    assert.ok(resumeTool, "expected subagent_send tool to be registered");
 
     const autoExitSchema = resumeTool.parameters.properties.autoExit;
     assert.equal(autoExitSchema.type, "boolean");
@@ -1603,12 +1816,12 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_interrupt in the main session extension", () => {
+  it("registers subagent_stop in the main session extension", () => {
     const { api, registeredTools } = createMockExtensionApi();
 
     (subagentsModule as any).default(api);
 
-    assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
+    assert.equal(registeredTools.some((tool) => tool.name === "subagent_stop"), true);
   });
 
   it("resolves interrupt targets by exact id and reports name ambiguity", () => {
@@ -1884,9 +2097,312 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Sub-agent "Worker" failed/);
     assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
-    assert.match(presentation, /subagent_resume/);
+    assert.match(presentation, /subagent_send/);
     assert.match(presentation, /Resume: pi --session/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
+  });
+});
+
+describe("subagent completion", () => {
+  it("keeps the child's report when closing its pane fails", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const previousMux = process.env.PI_SUBAGENT_MUX;
+    const previousWezterm = process.env.WEZTERM_UNIX_SOCKET;
+    process.env.PI_SUBAGENT_MUX = "wezterm";
+    delete process.env.WEZTERM_UNIX_SOCKET;
+    const dir = createTestDir();
+    try {
+      const sessionFile = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+      const running = {
+        id: "close-fail",
+        name: "Scout",
+        task: "T",
+        surface: "surface:404",
+        startTime: Date.now(),
+        sessionFile,
+        interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+      };
+      testApi.runningSubagents.set(running.id, running);
+
+      const result = await testApi.watchSubagent(running, new AbortController().signal);
+
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.summary, "Here is my plan...");
+      assert.equal(testApi.runningSubagents.has(running.id), false);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_MUX", previousMux);
+      restoreEnvVar("WEZTERM_UNIX_SOCKET", previousWezterm);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("concurrency cap", () => {
+  const testApi = (subagentsModule as any).__test__;
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  async function withMaxConcurrent(maxConcurrent: number, fn: () => Promise<void>) {
+    const dir = createTestDir();
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = dir;
+    writeFileSync(join(dir, "interactive-subagents.json"), JSON.stringify({ maxConcurrent }));
+    testApi.spawnSlots.clear();
+    try {
+      await fn();
+    } finally {
+      testApi.spawnSlots.clear();
+      restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  function startedLauncher() {
+    const launched: string[] = [];
+    const execute = async (_id: string, params: any) => {
+      launched.push(params.name);
+      return { content: [{ type: "text", text: "started" }], details: { name: params.name, status: "started" } };
+    };
+    return { launched, execute };
+  }
+
+  it("starts up to maxConcurrent at once and queues the rest in call order", async () => {
+    await withMaxConcurrent(4, async () => {
+      const { api, sentMessages } = createMockExtensionApi();
+      const { launched, execute } = startedLauncher();
+      const start = testApi.withSpawnSlot(api, execute);
+
+      const results = [];
+      for (const name of ["c1", "c2", "c3", "c4", "c5", "c6"]) results.push(await start("id", { name, task: "T" }));
+
+      assert.deepEqual(launched, ["c1", "c2", "c3", "c4"]);
+      assert.deepEqual(results.map((r: any) => r.details.status), ["started", "started", "started", "started", "queued", "queued"]);
+      assert.deepEqual(results.slice(4).map((r: any) => r.details.position), [1, 2]);
+      assert.match(results[4].content[0].text, /queued \(position 1\)/);
+
+      testApi.spawnSlots.release();
+      await tick();
+      assert.deepEqual(launched, ["c1", "c2", "c3", "c4", "c5"]);
+
+      testApi.spawnSlots.release();
+      await tick();
+      assert.deepEqual(launched, ["c1", "c2", "c3", "c4", "c5", "c6"]);
+      assert.equal(testApi.spawnSlots.held, 4);
+      assert.equal(sentMessages.length, 0);
+    });
+  });
+
+  it("frees the slot of a spawn that does not start a child", async () => {
+    await withMaxConcurrent(1, async () => {
+      const { api } = createMockExtensionApi();
+      const refusals = testApi.withSpawnSlot(api, async () => ({ content: [{ type: "text", text: "no mux" }], details: { error: "x" } }));
+      const throws = testApi.withSpawnSlot(api, async () => {
+        throw new Error("boom");
+      });
+      const { launched, execute } = startedLauncher();
+      const start = testApi.withSpawnSlot(api, execute);
+
+      await refusals("id", { name: "r", task: "T" });
+      await assert.rejects(throws("id", { name: "t", task: "T" }), /boom/);
+      const result = await start("id", { name: "ok", task: "T" });
+
+      assert.equal(result.details.status, "started");
+      assert.deepEqual(launched, ["ok"]);
+    });
+  });
+
+  it("reports a queued spawn that later fails to start as a parent turn and frees its slot", async () => {
+    await withMaxConcurrent(1, async () => {
+      const { api, sentMessages } = createMockExtensionApi();
+      const { launched, execute } = startedLauncher();
+      const start = testApi.withSpawnSlot(api, execute);
+      const failing = testApi.withSpawnSlot(api, async () => {
+        throw new Error("surface create failed");
+      });
+
+      await start("id", { name: "first", task: "T" });
+      const queuedFailure = await failing("id", { name: "doomed", task: "T" });
+      const queuedOk = await start("id", { name: "after", task: "T" });
+      assert.equal(queuedFailure.details.status, "queued");
+      assert.equal(queuedOk.details.position, 2);
+
+      testApi.spawnSlots.release();
+      await tick();
+
+      assert.equal(sentMessages.length, 1);
+      assert.equal(sentMessages[0].message.customType, "subagent_result");
+      assert.match(sentMessages[0].message.content, /"doomed" failed to start: surface create failed/);
+      assert.equal(sentMessages[0].message.details.exitCode, 1, "rendered as a failure, not a completion");
+      assert.deepEqual(sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
+      assert.deepEqual(launched, ["first", "after"]);
+    });
+  });
+
+  it("ends the watchers of children whose workspace the user closed and starts the queued child", async () => {
+    await withMaxConcurrent(4, async () => {
+      await withFakeCmux(async (cmux) => {
+        const { api } = createMockExtensionApi();
+        const { launched, execute } = startedLauncher();
+        const start = testApi.withSpawnSlot(api, execute);
+        for (const name of ["c1", "c2", "c3", "c4", "c5"]) await start("id", { name, task: "T" });
+        assert.deepEqual(launched, ["c1", "c2", "c3", "c4"]);
+
+        const dir = createTestDir();
+        const watchers = new AbortController();
+        try {
+          const children = launched.map((name) => ({
+            id: name,
+            name,
+            task: "T",
+            surface: createSurface(name, { layout: "grid", workspaceName: "agents: test" }),
+            startTime: Date.now(),
+            sessionFile: join(dir, `${name}.jsonl`),
+            interactive: false,
+            statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+          }));
+          cmux.update((state) => {
+            state.workspaces = {};
+          });
+
+          const results = await Promise.race([
+            Promise.all(children.map((child) => testApi.watchSubagent(child, watchers.signal))),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+          ]);
+          assert.ok(results, "every watcher ends once its pane is gone");
+          await tick();
+
+          for (const [i, result] of results.entries()) {
+            const report = testApi.resolveResultPresentation(result, result.name);
+            assert.match(report, /stopped after .*: its pane was closed before it finished/);
+            assert.ok(report.includes(`Session: ${children[i].sessionFile}`), "names the session to resume");
+          }
+          assert.deepEqual(launched, ["c1", "c2", "c3", "c4", "c5"]);
+        } finally {
+          watchers.abort();
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    });
+  });
+
+  it("keeps a Claude child's result when its sentinel lands while the closed pane is being read", async () => {
+    await withFakeCmux(async (cmux) => {
+      const surface = createSurface("c1", { layout: "tabs", workspaceName: "agents: test" });
+      const dir = createTestDir();
+      const sentinelFile = join(dir, "done.sentinel");
+      try {
+        cmux.update((state) => {
+          state.touch = { "read-screen": sentinelFile };
+          state.fail = { "read-screen": "Surface ref not found: " + surface };
+        });
+        const result = await pollForExit(surface, new AbortController().signal, { interval: 10, sentinelFile });
+        assert.equal(result.reason, "sentinel");
+      } finally {
+        closeSurface(surface);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("keeps watching a child while its pane cannot be read for a passing reason", async () => {
+    await withFakeCmux(async (cmux) => {
+      const surface = createSurface("c1", { layout: "tabs", workspaceName: "agents: test" });
+      cmux.update((state) => {
+        state.fail = { "read-screen": "Socket not found at /tmp/cmux.sock" };
+      });
+      const abort = new AbortController();
+      let settled = false;
+      const poll = pollForExit(surface, abort.signal, { interval: 10 }).finally(() => {
+        settled = true;
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(settled, false);
+      abort.abort();
+      await assert.rejects(poll, /Abort/);
+      closeSurface(surface);
+    });
+  });
+
+  it("keeps a finished child's report and admits waiters while the config file is mid-edit", async () => {
+    await withMaxConcurrent(1, async () => {
+      const { api } = createMockExtensionApi();
+      const { launched, execute } = startedLauncher();
+      const start = testApi.withSpawnSlot(api, execute);
+      await start("id", { name: "running", task: "T" });
+      await start("id", { name: "waiting", task: "T" });
+      await start("id", { name: "last", task: "T" });
+      writeFileSync(join(process.env.PI_CODING_AGENT_DIR!, "interactive-subagents.json"), '{ "maxConcurrent": ');
+
+      const previousMux = process.env.PI_SUBAGENT_MUX;
+      process.env.PI_SUBAGENT_MUX = "wezterm";
+      const dir = createTestDir();
+      try {
+        const sessionFile = createSessionFile(dir, [SESSION_HEADER, ASSISTANT_MSG]);
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        const result = await testApi.watchSubagent(
+          {
+            id: "w1",
+            name: "running",
+            task: "T",
+            surface: "surface:404",
+            startTime: Date.now(),
+            sessionFile,
+            interactive: false,
+            statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+          },
+          new AbortController().signal,
+        );
+        await tick();
+
+        assert.equal(result.exitCode, 0);
+        assert.equal(result.summary, "Here is my plan...");
+        assert.deepEqual(launched, ["running", "waiting"], "the last good limit of 1 still applies");
+        assert.doesNotThrow(() => testApi.discoverAgentDefinitions());
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_MUX", previousMux);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("releases a slot when a child's watcher ends", async () => {
+    await withMaxConcurrent(1, async () => {
+      const { api } = createMockExtensionApi();
+      const { launched, execute } = startedLauncher();
+      const start = testApi.withSpawnSlot(api, execute);
+      await start("id", { name: "running", task: "T" });
+      await start("id", { name: "waiting", task: "T" });
+
+      const previousMux = process.env.PI_SUBAGENT_MUX;
+      const previousWezterm = process.env.WEZTERM_UNIX_SOCKET;
+      process.env.PI_SUBAGENT_MUX = "wezterm";
+      delete process.env.WEZTERM_UNIX_SOCKET;
+      const dir = createTestDir();
+      try {
+        const sessionFile = createSessionFile(dir, [SESSION_HEADER, ASSISTANT_MSG]);
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        const running = {
+          id: "w1",
+          name: "running",
+          task: "T",
+          surface: "surface:404",
+          startTime: Date.now(),
+          sessionFile,
+          interactive: false,
+          statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+        };
+        await testApi.watchSubagent(running, new AbortController().signal);
+        await tick();
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_MUX", previousMux);
+        restoreEnvVar("WEZTERM_UNIX_SOCKET", previousWezterm);
+        rmSync(dir, { recursive: true, force: true });
+      }
+
+      assert.deepEqual(launched, ["running", "waiting"]);
+    });
   });
 });
 
@@ -2358,6 +2874,131 @@ describe("cmux.ts", () => {
 
     it("returns null when the parent pane cannot be found", () => {
       assert.equal(selectZellijPlacement([pane({ id: 10 })], 99), null);
+    });
+  });
+
+  describe("agents workspace grid", () => {
+    function place(tree: any, surface: string) {
+      const plan = planCmuxSplit(tree);
+      return { plan, tree: addCmuxSplit(tree, plan.from, plan.direction, surface) };
+    }
+
+    it("fills a 2x2 grid: right of 1, under 1, under 2", () => {
+      let tree: any = { surface: "c1" };
+      const plans = [];
+      for (const surface of ["c2", "c3", "c4"]) {
+        const placed = place(tree, surface);
+        plans.push(placed.plan);
+        tree = placed.tree;
+      }
+      assert.deepEqual(plans, [
+        { from: "c1", direction: "right" },
+        { from: "c1", direction: "down" },
+        { from: "c2", direction: "down" },
+      ]);
+    });
+
+    it("gives a new child the largest pane left after one closes", () => {
+      let tree: any = { surface: "c1" };
+      for (const surface of ["c2", "c3", "c4"]) tree = place(tree, surface).tree;
+
+      tree = removeCmuxPane(tree, "c1");
+      assert.deepEqual(planCmuxSplit(tree), { from: "c3", direction: "down" });
+
+      tree = removeCmuxPane(tree, "c4");
+      assert.deepEqual(planCmuxSplit(tree), { from: "c3", direction: "down" });
+      assert.equal(removeCmuxPane(removeCmuxPane(tree, "c3")!, "c2"), null);
+    });
+  });
+
+  describe("agents workspace cleanup", () => {
+    const placement = { layout: "tabs" as const, workspaceName: "agents: test" };
+
+    it("closes the workspace when the last child leaves nothing else in it", async () => {
+      await withFakeCmux(async (cmux) => {
+        const first = createSurface("c1", placement);
+        const second = createSurface("c2", placement);
+        const [ref] = Object.keys(cmux.workspaces());
+
+        closeSurface(first);
+        closeSurface(second);
+
+        assert.deepEqual(cmux.workspaces(), {});
+        assert.ok(cmux.calls().includes(`workspace close ${ref} --force`));
+      });
+    });
+
+    it("leaves a workspace holding the user's own terminal open and starts the next child in a new one", async () => {
+      await withFakeCmux(async (cmux) => {
+        const child = createSurface("c1", placement);
+        const [ref] = Object.keys(cmux.workspaces());
+        cmux.update((state) => {
+          state.workspaces[ref]["pane:user"] = ["surface:user"];
+        });
+
+        closeSurface(child);
+
+        assert.deepEqual(Object.values(cmux.workspaces()[ref]).flat(), ["surface:user"]);
+        assert.ok(!cmux.calls().some((call) => call.startsWith("workspace close")));
+
+        const next = createSurface("c2", placement);
+        const [, newRef] = Object.keys(cmux.workspaces());
+        assert.ok(newRef && newRef !== ref, "the next child gets a new workspace");
+        closeSurface(next);
+        assert.deepEqual(Object.keys(cmux.workspaces()), [ref]);
+      });
+    });
+
+    it("waits for cmux to accept a new workspace before setting it up", async () => {
+      await withFakeCmux(async (cmux) => {
+        cmux.update((state) => {
+          state.lagLookups = 3;
+        });
+
+        const child = createSurface("c1", placement);
+
+        const workspaces = cmux.workspaces();
+        assert.equal(Object.keys(workspaces).length, 1);
+        assert.ok(Object.values(workspaces).some((panes) => Object.values(panes).flat().includes(child)));
+        closeSurface(child);
+        assert.deepEqual(cmux.workspaces(), {});
+      });
+    });
+
+    it("leaves the workspace open when cmux cannot list what is in it", async () => {
+      await withFakeCmux(async (cmux) => {
+        const child = createSurface("c1", placement);
+        cmux.update((state) => {
+          state.fail = { "list-panes": "Socket not found at /tmp/cmux.sock" };
+        });
+
+        try {
+          closeSurface(child);
+        } catch {}
+
+        assert.ok(!cmux.calls().some((call) => call.startsWith("workspace close")));
+      });
+    });
+  });
+
+  describe("isPaneGoneError", () => {
+    it("tells a destroyed pane from a read that failed for a passing reason", () => {
+      const gone: Array<[any, string]> = [
+        ["cmux", "Error: not_found: Surface not found for the given surface_id"],
+        ["cmux", "Error: Workspace ref not found: workspace:7"],
+        ["tmux", "can't find pane: %12"],
+        ["tmux", "can't find window: @3"],
+        ["wezterm", "unexpected response Ok(ErrorResponse(ErrorResponse { reason: \"Error: no such pane 42\" }))"],
+      ];
+      const passing: Array<[any, string]> = [
+        ["cmux", "Error: Socket not found at /tmp/cmux.sock"],
+        ["cmux", "Error: timed out"],
+        ["tmux", "no server running on /private/tmp/tmux-502/default"],
+        ["wezterm", "While connecting to Socket: connection refused"],
+        ["zellij", "There is no pane with this id"],
+      ];
+      for (const [backend, stderr] of gone) assert.equal(isPaneGoneError(backend, { stderr }), true, stderr);
+      for (const [backend, stderr] of passing) assert.equal(isPaneGoneError(backend, { stderr }), false, stderr);
     });
   });
 
